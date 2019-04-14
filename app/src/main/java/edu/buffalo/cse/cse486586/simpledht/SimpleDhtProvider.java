@@ -10,17 +10,15 @@ import java.io.ObjectOutputStream;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.net.InetAddress;
-import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Formatter;
 import java.util.HashMap;
-import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutionException;
 
 import android.content.ContentProvider;
@@ -30,6 +28,7 @@ import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
 import android.os.AsyncTask;
+import android.os.NetworkOnMainThreadException;
 import android.telephony.TelephonyManager;
 import android.util.Log;
 
@@ -45,7 +44,7 @@ public class SimpleDhtProvider extends ContentProvider {
     private String pred;
     private String maxID;
     private String minID;
-    private HashMap<String, String> mapping;
+    private HashMap<String, String> mapping; /// 5554's mapping of portStr to hashed versions
     private HashMap<String, String> records;
     private Boolean isSolo = false;
     private ArrayList<String> id_list;
@@ -60,6 +59,7 @@ public class SimpleDhtProvider extends ContentProvider {
             key = k;
             value = val;
             pairs = d;
+
         }
     }
 
@@ -72,20 +72,14 @@ public class SimpleDhtProvider extends ContentProvider {
         }
     }
 
-    class Skoch{
-        private String newNode;
-
-        Skoch(String n, ArrayList<Dub> d){
-            newNode = n;
-
-        }
-    }
-
     @Override
     public boolean onCreate() {
         //not totally sure if should implement here but w/e
         TelephonyManager tel = (TelephonyManager) getContext().getSystemService(Context.TELEPHONY_SERVICE);
         portStr = tel.getLine1Number().substring(tel.getLine1Number().length() - 4);
+        mapping = new HashMap<String, String>();
+        records = new HashMap<String, String>();
+        id_list = new ArrayList<String>();
         try{
             nodeID = genHash(portStr);
             id_list.add(nodeID);
@@ -95,7 +89,6 @@ public class SimpleDhtProvider extends ContentProvider {
         catch(NoSuchAlgorithmException e){
             Log.e(TAG, e.getMessage());
         }
-        id_list = new ArrayList<String>();
         if(!portStr.equals("5554")) {
             try {
                 // put non 5554 joins here
@@ -106,39 +99,28 @@ public class SimpleDhtProvider extends ContentProvider {
                 BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
                 in.readLine();
                 socket.close();
-
-
-                // ok whats goin on, on, on,
-
-
-//                ObjectInputStream ois = new ObjectInputStream((socket.getInputStream()));
-//                Bundle bun = (Bundle)ois.readObject();
-//                String hashedKey = bun.key;
-//                String value = bun.value;
-//                String command = bun.command;
-//                ArrayList<Dub> pairs = bun.pairs;
-//                if (command.equals("populate")){
-//                    predID = hashedKey;
-//                    pred = value;
-//                    for(Dub pair : pairs){
-//                        insertOG(pair.k, pair.v);
-//                    }
-//                    //PrintWriter out = new PrintWriter()
-//
-//                }
-
             } catch (UnknownHostException e) {
                 Log.e(TAG, e.getMessage());
             } catch (IOException e) {
                 isSolo = true;
                 Log.e(TAG, e.getMessage());
-            }try {
-                ServerSocket serverSocket = new ServerSocket(10000);
-                new ServerTask().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, serverSocket);
             }
-            catch(IOException e){
-                Log.e(TAG, "CAN'T CREATE SERVER SOCKET");
+            catch (NetworkOnMainThreadException e){
+                Log.i(TAG, "BUG WHEN TRYNA CONNECT TO 5554");
+                isSolo = true;
             }
+        }
+        else{
+            isSolo = true;
+            Log.i(TAG, "EVERYONE THINKS THEY ARE 5554");
+
+        }
+        try {
+            ServerSocket serverSocket = new ServerSocket(10000);
+            new ServerTask().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, serverSocket);
+        }
+        catch(IOException e){
+            Log.e(TAG, "CAN'T CREATE SERVER SOCKET");
         }
         return false;
     }
@@ -157,28 +139,27 @@ public class SimpleDhtProvider extends ContentProvider {
         return uri;
     }
 
-    public Uri insertOG(String key, String value) {
+    public void insertOG(String key, String value) {
         // TODO Auto-generated method stub
+        records.put(key, value);
         value = value + "\n";
         FileOutputStream fos;
         try {
             // changed this to be genHash(key)
-            records.put(genHash(key), value);
-            fos = getContext().getApplicationContext().openFileOutput(genHash(key), Context.MODE_PRIVATE);
+            fos = getContext().getApplicationContext().openFileOutput(key, Context.MODE_PRIVATE);
             fos.write(value.getBytes());
             fos.close();
         } catch (Exception e) {
             e.printStackTrace();
             Log.e(TAG, "File write failed");
         }
-        return null;
     }
 
     @Override
     public int delete(Uri uri, String selection, String[] selectionArgs) {
         if(isSolo){
             // need to implement delete!
-            return deleteOG(selection);
+            deleteOG(selection);
         }
         String command = "delete";
         new ClientTask().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, command, selection);
@@ -188,8 +169,20 @@ public class SimpleDhtProvider extends ContentProvider {
 
     public int deleteOG(String selection) {
         // TODO Auto-generated method stub
-        // no clue if this works
-        String[] columnNames = {"key", "value"};
+        try {
+            if (selection.equals("@") || selection.equals("*")) {
+                // following iteration idiom obtained from https://stackoverflow.com/questions/1066589/iterate-through-a-hashmap
+                for (String key : records.keySet()) {
+                    getContext().deleteFile(key);
+                }
+                records.clear();
+                return 0;
+            }
+        }
+        catch(NullPointerException e){
+            Log.e(TAG, e.getMessage());
+        }
+        records.remove(selection);
         try {
             getContext().deleteFile(selection);
         }
@@ -203,12 +196,12 @@ public class SimpleDhtProvider extends ContentProvider {
     public Cursor query(Uri uri, String[] projection, String selection, String[] selectionArgs,
                         String sortOrder) {
         // TODO Auto-generated method stub
-        if(isSolo){
+        if(isSolo) {
             return queryOG(selection);
         }
-        // How to return?????
+        // How to return????? Apparently this works??????
         String command = "query";
-        AsyncTask task = new ClientTask().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, command, selection);
+        AsyncTask task = new ClientTask().executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, command, selection, nodeID);
         try {
             return (Cursor)task.get();
         }
@@ -222,27 +215,37 @@ public class SimpleDhtProvider extends ContentProvider {
     }
 
     public Cursor queryOG(String selection){
+        // maybe close the streams if something's wrong?
         String[] columnNames = {"key", "value"};
         MatrixCursor mcursor = new MatrixCursor(columnNames);
+        try{
+            if (selection.equals("@") || selection.equals("*")) {
+                for (String key : records.keySet()) {
+                    MatrixCursor.RowBuilder rowBuilder = mcursor.newRow();
+                    FileInputStream fis = new FileInputStream(getContext().getFileStreamPath(key));
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(fis));
+                    String msg = reader.readLine();
+                    rowBuilder.add("key", key);
+                    rowBuilder.add("value", msg);
+                }
+                return mcursor;
+            }
+        }
+        catch(IOException e){
+            Log.e(TAG, "query IOexception:  " + e.getMessage());
+        }
         MatrixCursor.RowBuilder rowBuilder = mcursor.newRow();
-        //https://www.baeldung.com/java-read-file        //cursor synchronization??
-        //Log.v("query", selection)
         try {
             Log.i(TAG, "key passed:" + selection);
             FileInputStream fis = new FileInputStream(getContext().getFileStreamPath(selection));
-            // Log.i(TAG, "fileReader created");
-
             BufferedReader reader = new BufferedReader(new InputStreamReader(fis));
-            //Log.i(TAG, "bufferedREader created");
-//            boolean First = true;
             String msg = reader.readLine();
-            //Log.i(TAG, "QUERY message received:" + msg);
             rowBuilder.add("key", selection);
             rowBuilder.add("value", msg);
         }
         catch (IOException e){
             Log.e(TAG, "query IOexception:" + e.getMessage());
-        };
+        }
         return mcursor;
     }
 
@@ -268,6 +271,10 @@ public class SimpleDhtProvider extends ContentProvider {
         return formatter.toString();
     }
 
+    private boolean isMinID(){
+        return (isSolo || (nodeID.compareTo(predID) < 0));
+    }
+
     // Begin asynchronous handling :-)
 
     private class ServerTask extends AsyncTask<ServerSocket, String, Void> {
@@ -278,16 +285,18 @@ public class SimpleDhtProvider extends ContentProvider {
                     Socket clisco = serverSocket.accept();
                     ObjectInputStream ois = new ObjectInputStream(clisco.getInputStream());
                     Bundle bun = (Bundle)ois.readObject();
-                    String hashedKey = bun.key;
+                    String key = bun.key;
+                    String hashedKey = genHash(bun.key);
                     String value = bun.value;
                     String command = bun.command;
                     ArrayList<Dub> pairs = bun.pairs;
                     if(command.equals("join")){
+                        isSolo = false;
                         PrintWriter pw = new PrintWriter(clisco.getOutputStream());
                         pw.write("acknowledgement!");
                         ois.close();
-                        pw.close();;
-                        clisco.close();;
+                        pw.close();
+                        clisco.close();
                         if(!portStr.equals("5554")){
                             Log.e(TAG, "Somehow a node besides 5554 was contacted for join");
                         }
@@ -297,11 +306,13 @@ public class SimpleDhtProvider extends ContentProvider {
                         if(hashedKey.compareTo(maxID) > 0){
                             predecessor = maxID;
                             successor = minID;
+                            succID = minID;
                             maxID = hashedKey;
                         }
                         else if(hashedKey.compareTo(minID) < 0){
                             predecessor = maxID;
                             successor = minID;
+                            maxID = minID;
                             minID = hashedKey;
                         }
                         else {
@@ -315,9 +326,11 @@ public class SimpleDhtProvider extends ContentProvider {
                                 }
                             }
                         }
+                        successor = mapping.get(successor);
+                        predecessor = mapping.get(predecessor);
                         // check above for logic errors
                         Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
-                                ((Integer.parseInt(value) * 2))); // connecting to newnode's pred
+                                ((Integer.parseInt(predecessor) * 2))); // connecting to newnode's pred
                         Bundle bung = new Bundle("update", nodeID, value, null); //value is actually newnode's portStr
                         ObjectOutputStream oos = new ObjectOutputStream(socket.getOutputStream());
                         ObjectInputStream gasp = new ObjectInputStream(socket.getInputStream());
@@ -327,7 +340,7 @@ public class SimpleDhtProvider extends ContentProvider {
                         oos.close();
                         socket.close();
                         Socket redir = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
-                                ((Integer.parseInt(hashedKey) * 2)));
+                                ((Integer.parseInt(value) * 2)));
                         ObjectOutputStream scooby = new ObjectOutputStream(redir.getOutputStream());
                         BufferedReader doo = new BufferedReader(new InputStreamReader(redir.getInputStream()));
                         scooby.writeObject(vom);
@@ -339,7 +352,7 @@ public class SimpleDhtProvider extends ContentProvider {
                                 ((Integer.parseInt(successor) * 2)));
                         ObjectOutputStream lorin = new ObjectOutputStream(epi.getOutputStream());
                         BufferedReader greg = new BufferedReader(new InputStreamReader(epi.getInputStream()));
-                        lorin.writeObject(new Bundle("succdate", hashedKey, value, null));
+                        lorin.writeObject(new Bundle("succdate", key, value, null));
                         greg.readLine();
                         lorin.close();
                         greg.close();
@@ -350,11 +363,11 @@ public class SimpleDhtProvider extends ContentProvider {
                         String newNode = hashedKey;
                         succ = newPort;
                         succID = value;
-                        Bundle beavis = new Bundle("populate", predID, pred, new ArrayList<Dub>());
-                        for(String key : records.keySet()){
-                            if (key.compareTo(succID) > 0) {
-                                beavis.pairs.add(new Dub(key, records.get(key)));
-                                deleteOG(key);
+                        Bundle beavis = new Bundle("populate", succ, pred, new ArrayList<Dub>());
+                        for(String keyboi : records.keySet()){
+                            if (keyboi.compareTo(succID) > 0) {
+                                beavis.pairs.add(new Dub(keyboi, records.get(keyboi)));
+                                deleteOG(keyboi);
                             }
                         }
                         ObjectOutputStream oos = new ObjectOutputStream(clisco.getOutputStream());
@@ -363,8 +376,10 @@ public class SimpleDhtProvider extends ContentProvider {
                         oos.close();
                         clisco.close();
                     } else if (command.equals("populate")){
-                        predID = hashedKey;
+                        succ = key;
+                        succID = hashedKey;
                         pred = value;
+                        predID = genHash(value);
                         for(Dub pair : pairs){
                             insertOG(pair.k, pair.v);
                         }
@@ -375,19 +390,26 @@ public class SimpleDhtProvider extends ContentProvider {
                         clisco.close();
 
                     } else if (command.equals("succdate")){
-                        succ = value;
-                        succID = hashedKey;
+                        pred = value;
+                        predID = key;
                         PrintWriter out = new PrintWriter(new OutputStreamWriter(clisco.getOutputStream()));
+                        out.write("acknowledgement!");
                         ois.close();
+                        out.close();
                         clisco.close();
                     }
                     else if (command.equals("insert")) {
-                        if (hashedKey.compareTo(nodeID) >= 0 && hashedKey.compareTo(succID) < 0) {
+                        if (hashedKey.compareTo(nodeID) <= 0 && hashedKey.compareTo(predID) > 0) {
                             insertOG(hashedKey, value);
-                        } else if (nodeID.equals(maxID) && hashedKey.compareTo(maxID) > 0) {
+                        } else if (isMinID() && hashedKey.compareTo(maxID) > 0) {
                             insertOG(hashedKey, value);
                         } else {
                             try {
+                                PrintWriter pw = new PrintWriter(clisco.getOutputStream());
+                                pw.write("acknowledgement!");
+                                ois.close();
+                                pw.close();
+                                clisco.close();
                                 Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
                                         Integer.parseInt(succ));
                                 Bundle bundle = new Bundle(command, hashedKey, value, null);
@@ -403,15 +425,20 @@ public class SimpleDhtProvider extends ContentProvider {
                             }
                         }
                     } else if (command.equals("query")) {
-                        if (hashedKey.compareTo(nodeID) >= 0 && hashedKey.compareTo(succID) < 0) {
-                            queryOG(hashedKey);
-                        } else if (nodeID.equals(maxID) && hashedKey.compareTo(maxID) > 0) {
-                            queryOG(hashedKey);
+                        if (hashedKey.compareTo(nodeID) <= 0 && hashedKey.compareTo(predID) > 0) {
+                            queryOG(key);
+                        } else if (isMinID() && hashedKey.compareTo(maxID) > 0) {
+                            queryOG(key);
                         } else {
                             try {
+                                PrintWriter pw = new PrintWriter(clisco.getOutputStream());
+                                pw.write("acknowledgement!");
+                                ois.close();
+                                pw.close();
+                                clisco.close();
                                 Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
                                         Integer.parseInt(succ));
-                                Bundle bundle = new Bundle(command, hashedKey, null, null);
+                                Bundle bundle = new Bundle(command, key, null, null);
                                 ObjectOutputStream oos = new ObjectOutputStream(socket.getOutputStream());
                                 BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
                                 oos.writeObject(bundle);
@@ -424,15 +451,20 @@ public class SimpleDhtProvider extends ContentProvider {
                             }
                         }
                     } else if (command.equals("delete")) {
-                        if (hashedKey.compareTo(nodeID) >= 0 && hashedKey.compareTo(succID) < 0) {
-                            queryOG(hashedKey);
-                        } else if (nodeID.equals(maxID) && hashedKey.compareTo(maxID) > 0) {
-                            queryOG(hashedKey);
+                        if (hashedKey.compareTo(nodeID) <= 0 && hashedKey.compareTo(predID) > 0) {
+                            deleteOG(key);
+                        } else if (isMinID() && hashedKey.compareTo(maxID) > 0) {
+                            deleteOG(key);
                         } else {
                             try {
+                                PrintWriter pw = new PrintWriter(clisco.getOutputStream());
+                                pw.write("acknowledgement!");
+                                ois.close();
+                                pw.close();
+                                clisco.close();
                                 Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
                                         Integer.parseInt(succ));
-                                Bundle bundle = new Bundle(command, hashedKey, null, null);
+                                Bundle bundle = new Bundle(command, key, null, null);
                                 ObjectOutputStream oos = new ObjectOutputStream(socket.getOutputStream());
                                 BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
                                 oos.writeObject(bundle);
@@ -453,6 +485,10 @@ public class SimpleDhtProvider extends ContentProvider {
                 catch(ClassNotFoundException e){
                     Log.e(TAG, e.getLocalizedMessage());
                 }
+                catch(NoSuchAlgorithmException e){
+                    Log.e(TAG, e.getLocalizedMessage());
+
+                }
             }
         }
     }
@@ -461,6 +497,7 @@ public class SimpleDhtProvider extends ContentProvider {
         // Currently assuming that msgs will hold both the command and values passed
         protected Void doInBackground(String... msgs) {
             String command = msgs[0];
+            String key = msgs[1];
             String hashedKey = null;
             try {
                 hashedKey = genHash(msgs[1]);
@@ -469,17 +506,17 @@ public class SimpleDhtProvider extends ContentProvider {
             }
             if(command.equals("insert")){
                 String value = msgs[2];
-                if(hashedKey.compareTo(nodeID) >= 0 && hashedKey.compareTo(succID) < 0){
+                if(hashedKey.compareTo(nodeID) <= 0 && hashedKey.compareTo(predID) > 0){
                     insertOG(hashedKey, value);
                 }
-                else if(nodeID.equals(maxID) && hashedKey.compareTo(maxID) > 0){
+                else if(isMinID() && hashedKey.compareTo(maxID) > 0){
                     insertOG(hashedKey, value);
                 }
                 else{
                     try {
                         Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
                                 Integer.parseInt(succ));
-                        Bundle bundle = new Bundle(command, hashedKey, value, null);
+                        Bundle bundle = new Bundle(command, key, value, null);
                         ObjectOutputStream oos = new ObjectOutputStream(socket.getOutputStream());
                         BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
                         oos.writeObject(bundle);
@@ -494,53 +531,70 @@ public class SimpleDhtProvider extends ContentProvider {
                 }
             }
             else if(command.equals("query")){
-                if(hashedKey.compareTo(nodeID) >= 0 && hashedKey.compareTo(succID) < 0){
-                    queryOG(hashedKey);
-                }
-                else if(nodeID.equals(maxID) && hashedKey.compareTo(maxID) > 0){
-                    queryOG(hashedKey);
-                }
-                else{
-                    try{
-                        Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
-                                Integer.parseInt(succ));
-                        Bundle bundle = new Bundle(command, hashedKey, null, null);
-                        ObjectOutputStream oos = new ObjectOutputStream(socket.getOutputStream());
-                        BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-                        oos.writeObject(bundle);
-                        in.readLine();
-                        oos.close();
-                        in.close();
-                        socket.close();
+                try {
+                    if(hashedKey.equals(genHash("@"))){
+                        queryOG(key);
                     }
-                    catch(IOException e){
-                        Log.e(TAG, e.getMessage());
+                    else if(hashedKey.equals(genHash("*"))){
+                        queryOG(key);
                     }
+                    else if(hashedKey.compareTo(nodeID) <= 0 && hashedKey.compareTo(predID) > 0){
+                        queryOG(key);
+                    }
+                    else if(isMinID() && hashedKey.compareTo(maxID) > 0){
+                        queryOG(key);
+                    }
+                    else{
+                        try{
+                            Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
+                                    Integer.parseInt(succ));
+                            Bundle bundle = new Bundle(command, key, null, null);
+                            ObjectOutputStream oos = new ObjectOutputStream(socket.getOutputStream());
+                            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                            oos.writeObject(bundle);
+                            in.readLine();
+                            oos.close();
+                            in.close();
+                            socket.close();
+                        }
+                        catch(IOException e){
+                            Log.e(TAG, e.getMessage());
+                        }
+                    }
+                } catch (NoSuchAlgorithmException e) {
+                    e.printStackTrace();
                 }
             }
             else if(command.equals("delete")){
-                if(hashedKey.compareTo(nodeID) >= 0 && hashedKey.compareTo(succID) < 0){
-                    deleteOG(hashedKey);
-                }
-                else if(nodeID.equals(maxID) && hashedKey.compareTo(maxID) > 0){
-                    deleteOG(hashedKey);
-                }
-                else{
-                    try{
-                        Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
-                                Integer.parseInt(succ));
-                        Bundle bundle = new Bundle(command, hashedKey, null, null);
-                        ObjectOutputStream oos = new ObjectOutputStream(socket.getOutputStream());
-                        BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-                        oos.writeObject(bundle);
-                        in.readLine();
-                        oos.close();
-                        in.close();
-                        socket.close();
+                try {
+                    if(hashedKey.equals(genHash("@"))){
+                        deleteOG(key);
                     }
-                    catch(IOException e){
-                        Log.e(TAG, e.getMessage());
+                    else if(hashedKey.compareTo(nodeID) <= 0 && hashedKey.compareTo(predID) > 0){
+                        deleteOG(key);
                     }
+                    else if(isMinID() && hashedKey.compareTo(maxID) > 0){
+                        deleteOG(key);
+                    }
+                    else{
+                        try{
+                            Socket socket = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
+                                    Integer.parseInt(succ));
+                            Bundle bundle = new Bundle(command, key, null, null);
+                            ObjectOutputStream oos = new ObjectOutputStream(socket.getOutputStream());
+                            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                            oos.writeObject(bundle);
+                            in.readLine();
+                            oos.close();
+                            in.close();
+                            socket.close();
+                        }
+                        catch(IOException e){
+                            Log.e(TAG, e.getMessage());
+                        }
+                    }
+                } catch (NoSuchAlgorithmException e) {
+                    e.printStackTrace();
                 }
             }
             return null;
